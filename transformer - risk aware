@@ -1,0 +1,395 @@
+
+# Transformer + Risk-aware Stock Trading System
+# - 미래 수익률(Return) 예측
+# - 미래 변동성(Volatility) 예측
+# - 저변동 구간만 투자
+# - 장기 복리형 안정 전략
+#
+# 사용 라이브러리:
+# pip install finance-datareader tensorflow scikit-learn pandas numpy
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import FinanceDataReader as fdr
+
+from sklearn.preprocessing import MinMaxScaler
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input,
+    Dense,
+    Dropout,
+    LayerNormalization,
+    MultiHeadAttention,
+    GlobalAveragePooling1D
+)
+from tensorflow.keras.callbacks import EarlyStopping
+
+
+
+#  시가총액 상위 종목 가져오기
+
+def get_top_5_tickers():
+
+    try:
+        df_krx = fdr.StockListing('KRX')
+
+        if 'MarCap' in df_krx.columns:
+            df_krx = df_krx.sort_values(
+                'MarCap',
+                ascending=False
+            )
+
+        elif 'MarketCap' in df_krx.columns:
+            df_krx = df_krx.sort_values(
+                'MarketCap',
+                ascending=False
+            )
+
+        else:
+            raise Exception("시가총액 컬럼 없음")
+
+        top_5 = df_krx.head(5)
+
+        return (
+            top_5['Code'].tolist(),
+            top_5['Name'].tolist()
+        )
+
+    except Exception as e:
+
+        print("기본 종목 사용:", e)
+
+        return (
+            ["005930", "000660", "373220", "207940", "005380"],
+            ["삼성전자", "SK하이닉스", "LG엔솔", "삼성바이오", "현대차"]
+        )
+
+
+# 데이터 수집 + 기술지표 생성
+
+def fetch_and_prepare(ticker, days=400):
+
+    start_date = (
+        pd.to_datetime('today')
+        - pd.Timedelta(days=days)
+    ).strftime('%Y-%m-%d')
+
+    try:
+
+        df = fdr.DataReader(ticker, start_date)
+
+        if df.empty or len(df) < 100:
+            return None
+
+        # -------------------------------------------------
+        # 수익률(Return)
+        # -------------------------------------------------
+        df['Return'] = df['Close'].pct_change()
+
+        # -------------------------------------------------
+        # 변동성(10일 rolling std)
+        # -------------------------------------------------
+        df['Volatility'] = (
+            df['Return']
+            .rolling(10)
+            .std()
+        )
+
+        # -------------------------------------------------
+        # 볼린저 밴드
+        # -------------------------------------------------
+        ma20 = df['Close'].rolling(20).mean()
+        std20 = df['Close'].rolling(20).std()
+
+        df['Upper_Band'] = ma20 + (std20 * 2)
+        df['Lower_Band'] = ma20 - (std20 * 2)
+
+        # -------------------------------------------------
+        # 볼린저 밴드 폭
+        # -------------------------------------------------
+        df['BB_Width'] = (
+            (df['Upper_Band'] - df['Lower_Band'])
+            / ma20
+        )
+
+        # -------------------------------------------------
+        # 이동평균
+        # -------------------------------------------------
+        df['MA20'] = ma20
+
+        # -------------------------------------------------
+        # 거래량 변화율
+        # -------------------------------------------------
+        df['Volume_Change'] = df['Volume'].pct_change()
+
+        # -------------------------------------------------
+        # 결측 제거
+        # -------------------------------------------------
+        df = df.dropna()
+
+        return df
+
+    except Exception as e:
+
+        print(f"{ticker} 데이터 오류:", e)
+
+        return None
+
+
+# =========================================================
+# 3. Transformer 모델 생성
+# =========================================================
+
+def build_transformer(input_shape):
+
+    inputs = Input(shape=input_shape)
+
+    # -------------------------------------------------
+    # Attention
+    # -------------------------------------------------
+    attention = MultiHeadAttention(
+        num_heads=4,
+        key_dim=32
+    )(inputs, inputs)
+
+    x = LayerNormalization()(attention + inputs)
+
+    # -------------------------------------------------
+    # Feed Forward
+    # -------------------------------------------------
+    x_ff = Dense(128, activation='relu')(x)
+    x_ff = Dropout(0.2)(x_ff)
+
+    x = LayerNormalization()(x + x_ff)
+
+    # -------------------------------------------------
+    # Pooling
+    # -------------------------------------------------
+    x = GlobalAveragePooling1D()(x)
+
+    x = Dense(64, activation='relu')(x)
+    x = Dropout(0.2)(x)
+
+    # -------------------------------------------------
+    # 출력:
+    # [예상 수익률, 예상 변동성]
+    # -------------------------------------------------
+    outputs = Dense(2)(x)
+
+    model = Model(inputs, outputs)
+
+    model.compile(
+        optimizer='adam',
+        loss='mse'
+    )
+
+    return model
+
+
+#  데이터셋 생성
+
+def create_dataset(df, window_size=20):
+
+    features = [
+        'Close',
+        'Volume',
+        'Return',
+        'Volatility',
+        'BB_Width',
+        'MA20'
+    ]
+
+    scaler = MinMaxScaler()
+
+    scaled_data = scaler.fit_transform(df[features])
+
+    X = []
+    y = []
+
+    for i in range(len(scaled_data) - window_size - 1):
+
+        X.append(
+            scaled_data[i:i + window_size]
+        )
+
+        # ---------------------------------------------
+        # 미래 수익률
+        # ---------------------------------------------
+        future_return = df['Return'].iloc[
+            i + window_size
+        ]
+
+        # ---------------------------------------------
+        # 미래 변동성
+        # ---------------------------------------------
+        future_vol = df['Volatility'].iloc[
+            i + window_size
+        ]
+
+        y.append([
+            future_return,
+            future_vol
+        ])
+
+    return np.array(X), np.array(y), scaler
+
+
+#  Risk-aware 투자 판단
+
+def risk_aware_signal(
+    pred_return,
+    pred_vol,
+    bb_width
+):
+
+    # ---------------------------------------------
+    # 조건
+    # ---------------------------------------------
+    RETURN_THRESHOLD = 0.003
+    VOL_THRESHOLD = 0.02
+    BB_THRESHOLD = 0.15
+
+    if (
+        pred_return > RETURN_THRESHOLD
+        and pred_vol < VOL_THRESHOLD
+        and bb_width < BB_THRESHOLD
+    ):
+        return "BUY"
+
+    return "HOLD"
+
+
+#  메인 실행
+
+def main():
+
+    codes, names = get_top_5_tickers()
+
+    window_size = 20
+
+    for ticker, name in zip(codes, names):
+
+        print("\n================================================")
+        print(f"[분석 시작] {name} ({ticker})")
+        print("================================================")
+
+        df = fetch_and_prepare(ticker)
+
+        if df is None:
+
+            print("데이터 부족")
+            continue
+
+        # -------------------------------------------------
+        # 데이터 생성
+        # -------------------------------------------------
+        X, y, scaler = create_dataset(
+            df,
+            window_size
+        )
+
+        if len(X) < 50:
+
+            print("학습 데이터 부족")
+            continue
+
+        # -------------------------------------------------
+        # Train/Test Split
+        # -------------------------------------------------
+        split = int(len(X) * 0.8)
+
+        X_train = X[:split]
+        X_test = X[split:]
+
+        y_train = y[:split]
+        y_test = y[split:]
+
+        # -------------------------------------------------
+        # 모델 생성
+        # -------------------------------------------------
+        model = build_transformer(
+            (
+                X_train.shape[1],
+                X_train.shape[2]
+            )
+        )
+
+        # -------------------------------------------------
+        # Early Stopping
+        # -------------------------------------------------
+        early_stop = EarlyStopping(
+            monitor='val_loss',
+            patience=5,
+            restore_best_weights=True
+        )
+
+        # -------------------------------------------------
+        # 학습
+        # -------------------------------------------------
+        model.fit(
+            X_train,
+            y_train,
+            validation_data=(X_test, y_test),
+            epochs=30,
+            batch_size=16,
+            verbose=0,
+            callbacks=[early_stop]
+        )
+
+        # -------------------------------------------------
+        # 최근 데이터 예측
+        # -------------------------------------------------
+        recent_data = X[-1].reshape(
+            1,
+            window_size,
+            X.shape[2]
+        )
+
+        pred = model.predict(
+            recent_data,
+            verbose=0
+        )[0]
+
+        pred_return = pred[0]
+        pred_vol = abs(pred[1])
+
+        # -------------------------------------------------
+        # 현재 볼린저 폭
+        # -------------------------------------------------
+        current_bb_width = df['BB_Width'].iloc[-1]
+
+        # -------------------------------------------------
+        # 매매 신호
+        # -------------------------------------------------
+        signal = risk_aware_signal(
+            pred_return,
+            pred_vol,
+            current_bb_width
+        )
+
+        # -------------------------------------------------
+        # 출력
+        # -------------------------------------------------
+        print(f"예상 수익률 : {pred_return:.4f}")
+        print(f"예상 변동성 : {pred_vol:.4f}")
+        print(f"볼린저 폭   : {current_bb_width:.4f}")
+
+        print("\n[최종 판단]")
+
+        if signal == "BUY":
+
+            print(f"★ {name} 저변동 안정 구간 → 매수 고려")
+
+        else:
+
+            print(f"● {name} 변동성 위험 → 관망")
+
+
+# 실행
+
+if __name__ == "__main__":
+    main()
